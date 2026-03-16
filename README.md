@@ -22,3 +22,12 @@ Este repositorio contiene ejemplos reproducibles (principalmente notebooks) para
 > Nota: iré agregando más demos con una estructura consistente y pasos claros de ejecución.
 
 
+## Cómo usar (rápido)
+
+![Cómo clonar el repo desde GitHub](https://github.com/aleazofeifam/Bricksdemos/blob/main/img/Clone%20git%20folder.png)
+https://github.com/aleazofeifam/Bricksdemos.git
+
+### Opción 1 — Clonar en tu máquina
+```bash
+git clone https://github.com/aleazofeifam/Bricksdemos.git
+cd Bricksdemos
