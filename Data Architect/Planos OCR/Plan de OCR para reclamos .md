@@ -1,6 +1,6 @@
 # Arquitectura de Referencia: Gestion de Reclamos de Seguros en Databricks
 
-> Documento de arquitectura end-to-end para el proceso de gestion de reclamos (claims)
+> Documento de arquitectura end-to-end para el proceso de gestion de reclamos (claims) alto nivel
 > de una empresa de seguros, utilizando exclusivamente componentes de la plataforma Databricks.
 
 ---
