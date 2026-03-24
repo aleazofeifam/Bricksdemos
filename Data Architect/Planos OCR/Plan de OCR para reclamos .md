@@ -3,6 +3,8 @@
 > Documento de arquitectura end-to-end para el proceso de gestion de reclamos (claims) alto nivel
 > de una empresa de seguros.
 
+> **Stack**: 100% Databricks — Unity Catalog, ai_parse_document, ai_query,
+> Lakeflow SDP, Lakebase, Model Serving, AI/BI Dashboards.
 ---
 
 ## Tabla de Contenidos
