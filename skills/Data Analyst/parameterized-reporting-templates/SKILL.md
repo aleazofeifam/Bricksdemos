@@ -1,56 +1,287 @@
 ---
 name: parameterized-reporting-templates
-description: Templates de reportes parametrizados en Databricks SQL — queries con parámetros dinámicos, scheduled reports por audiencia, y distribución automática de insights. Úsala cuando necesites enviar reportes personalizados a distintos stakeholders sin duplicar queries.
+description: Diseña reporting reutilizable y parametrizado en Databricks SQL y AI/BI Dashboards, incluyendo filtros, parámetros y distribución programada. Se usa cuando distintas audiencias necesitan variantes controladas del mismo reporte sin duplicar queries, dashboards o lógica de negocio.
 ---
 
 # Parameterized Reporting Templates
 
-Cómo crear reportes dinámicos que se adapten por audiencia sin duplicar lógica.
+Construye reporting reutilizable sin proliferar copias del mismo análisis.
 
-## Query con parámetros
+## Principio
+
+Antes de crear un reporte recurrente, decidir si el usuario necesita:
+
+```text
+explorar → Genie Agent
+
+monitorear → AI/BI Dashboard
+
+recibir → Dashboard subscription
+
+extraer/intercambiar datos → workflow específico
+```
+
+No convertir toda pregunta recurrente en un email programado.
+
+---
+
+## 1. Discover
+
+Identificar:
+
+```text
+Audiencia:
+Decisión:
+Frecuencia:
+Canal:
+Parámetros:
+KPIs:
+Periodo:
+Frescura:
+Necesidad de interacción:
+Necesidad de archivo adjunto:
+```
+
+Preguntar también:
+
+- ¿el destinatario realmente necesita recibir el reporte?
+- ¿puede consultar el dato directamente?
+- ¿requiere investigación posterior?
+
+---
+
+## 2. Validate semantic reuse
+
+Antes de crear la query:
+
+- buscar Metric Views;
+- verificar KPIs;
+- evitar duplicar fórmulas;
+- utilizar dimensiones gobernadas.
+
+Si cuatro reportes calculan `revenue` independientemente, el problema probablemente está en la capa semántica.
+
+---
+
+## 3. Parameterize the dataset
+
+Ejemplo:
 
 ```sql
--- Parámetros: :region, :start_date, :end_date
+-- Reporte regional reutilizable.
 SELECT
-  DATE_TRUNC('WEEK', order_date) AS week,
-  region,
-  COUNT(DISTINCT customer_id) AS unique_customers,
-  SUM(amount) AS revenue,
-  AVG(amount) AS avg_order_value
-FROM production.gold.orders
+    DATE_TRUNC('WEEK', order_date) AS semana,
+    region,
+    MEASURE(total_revenue) AS ingreso_total,
+    MEASURE(order_count) AS pedidos
+FROM production.metrics.sales
 WHERE region = :region
-  AND order_date BETWEEN :start_date AND :end_date
-GROUP BY week, region
-ORDER BY week DESC
+  AND order_date >= :start_date
+  AND order_date < :end_date
+GROUP BY
+    DATE_TRUNC('WEEK', order_date),
+    region
+ORDER BY semana DESC;
 ```
 
-## Distribución por audiencia (Job notebook)
+Usar parámetros cuando el valor realmente cambia la consulta.
 
-```python
-regions = ["LATAM", "EMEA", "APAC", "NAM"]
-recipients = {"LATAM": "cfo-latam@co.com", "EMEA": "cfo-emea@co.com"}
+Usar field filters cuando sólo se necesita interacción sobre campos ya retornados.
 
-for region in regions:
-    # Ejecutar query parametrizada
-    report_df = spark.sql(f"""
-      SELECT * FROM production.gold.weekly_summary
-      WHERE region = '{region}'
-        AND week >= DATE_TRUNC('WEEK', CURRENT_DATE() - INTERVAL 4 WEEKS)
-    """)
+No construir SQL mediante concatenación de strings con input del usuario.
 
-    # Guardar como CSV en Volume
-    path = f"/Volumes/production/reports/weekly/{region}_{today}.csv"
-    report_df.toPandas().to_csv(path, index=False)
+---
 
-    # Notificar (via webhook o email API)
-    print(f"Report for {region} saved to {path}")
+## 4. Reuse instead of cloning
+
+Default:
+
+```text
+1 dataset parametrizado
+        ↓
+1 dashboard/report reusable
+        ↓
+varios consumidores
 ```
+
+Evitar:
+
+```text
+dashboard_latam
+dashboard_emea
+dashboard_apac
+dashboard_nam
+```
+
+salvo que las audiencias tengan necesidades verdaderamente distintas.
+
+---
+
+## 5. Choose push vs pull
+
+### Pull
+
+El usuario entra a consultar.
+
+Preferir:
+
+- Genie;
+- dashboard interactivo;
+- link compartido.
+
+### Push
+
+El usuario necesita recibir información en un momento determinado.
+
+Preferir las subscriptions nativas de AI/BI Dashboards cuando satisfagan el requerimiento.
+
+No construir un notebook de email, webhook o exportación personalizada sin demostrar primero que las capacidades nativas son insuficientes.
+
+---
+
+## 6. Design each scheduled report
+
+Definir:
+
+```text
+Owner:
+Audiencia:
+Motivo:
+Schedule:
+Timezone:
+Dataset:
+Parámetros:
+Frescura esperada:
+Canal:
+Criterio de retiro:
+```
+
+Todo schedule debe tener owner.
+
+Los reportes sin uso deben poder retirarse.
+
+---
+
+## 7. Validate recipient access
+
+Antes de distribuir:
+
+- revisar sensibilidad;
+- revisar permisos;
+- revisar datos visibles;
+- revisar parámetros;
+- comprobar que el resultado corresponde a la audiencia correcta.
+
+No asumir que el hecho de poder generar un archivo implica que deba distribuirse.
+
+---
+
+## 8. Add conversational follow-up
+
+Si el reporte genera recurrentemente preguntas como:
+
+```text
+¿Por qué cambió?
+¿qué región explica esto?
+¿qué clientes están detrás?
+¿qué pasó la semana anterior?
+```
+
+evaluar proporcionar acceso al Genie Agent del mismo dominio.
+
+Push para informar.
+
+Genie para investigar.
+
+---
+
+## Output
+
+```text
+Reporte:
+Owner:
+
+Audiencia:
+Canal:
+
+KPIs:
+- ...
+
+Metric Views:
+- ...
+
+Parámetros:
+- ...
+
+Schedule:
+- ...
+
+Permisos:
+- ...
+
+Alternativa Genie:
+- ...
+
+Criterio de retiro:
+- ...
+```
+
+---
+
+## Databricks decision gates
+
+### AI/BI Dashboards
+
+Core.
+
+### Metric Views
+
+Aplicable para mantener KPIs consistentes.
+
+### Genie Agents
+
+Aplicable cuando los consumidores requieren follow-up analítico.
+
+### Custom notebook/report pipeline
+
+Sólo si las capacidades administradas no satisfacen el caso.
+
+### Spark Declarative Pipelines
+
+No usar para distribuir reportes. Delegar sólo si falta la transformación upstream.
+
+### AI Functions
+
+Aplicable si el reporte requiere enriquecimiento de texto o datos no estructurados.
+
+### Lakebase
+
+No forzar.
+
+### Unity AI Gateway
+
+No forzar.
+
+---
+
+## Definition of Done
+
+- [ ] Está claro por qué el reporte debe existir.
+- [ ] Existe owner.
+- [ ] Los KPIs fueron verificados.
+- [ ] Se revisaron Metric Views.
+- [ ] La query reutiliza parámetros de forma segura.
+- [ ] Se evitó duplicar dashboards innecesariamente.
+- [ ] Se eligió conscientemente push o pull.
+- [ ] Se evaluaron subscriptions nativas.
+- [ ] Se revisaron permisos.
+- [ ] Se evaluó Genie para preguntas posteriores.
+- [ ] La documentación está en español.
 
 ## Gotchas
 
-* Los parámetros de Databricks SQL NO soportan listas dinámicas. `WHERE region IN (:regions)` con multi-select no funciona. Usar ARRAY_CONTAINS o string parsing.
-* Scheduled dashboards envían snapshot estático (imagen), no interactivo. Para interactivo: compartir link con filtro pre-aplicado.
-* Para PDF export: usar la API `POST /api/2.0/sql/dashboards/{id}/export` (no es self-service aún).
-* Si el reporte necesita lógica condicional compleja, usar notebook + job en vez de dashboard parametrizado.
-* Los parámetros de fecha deben tener DEFAULT value para que el schedule funcione sin intervención humana.
-* Following workspace policies: scheduled refresh no menor a 12 horas.
+- No construir un sistema de distribución custom cuando existe una capacidad administrada suficiente.
+- No duplicar lógica al personalizar por audiencia.
+- No confundir refresh del dashboard con frecuencia de actualización del dato fuente.
+- No mantener reportes sin owner.
+- No enviar información sensible a destinatarios no autorizados.

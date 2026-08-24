@@ -1,229 +1,716 @@
 ---
 name: etl-to-sdp-refactor
-description: >
-  Refactoriza código ETL tradicional (notebooks PySpark, scripts SQL, spark.read/write manuales)
-  a Spark Declarative Pipelines (SDP/DLT). Lee el código fuente, hace preguntas de clarificación,
-  genera el pipeline refactorizado, y orquesta otros skills (data-quality-expectations para
-  expectations, databricks-spark-declarative-pipelines para sintaxis). Úsala cuando el usuario
-  diga "migrar a DLT", "refactorizar a SDP", "convertir mi ETL", "modernizar pipeline",
-  "pasar a streaming tables", o tenga código legacy con spark.read().write() que quiera
-  convertir a declarativo.
+description: Refactoriza ETL imperativo, notebooks PySpark/SQL, pipelines DLT legacy y orquestación manual hacia Lakeflow pipelines basados en Spark Declarative Pipelines. Úsala cuando existan spark.read/write manuales, MERGE imperativos para CDC, dbutils.notebook.run, código DLT antiguo, pipelines difíciles de mantener o solicitudes de "modernizar ETL", "migrar DLT", "convertir a SDP" o "usar Spark Declarative Pipelines".
 ---
 
-# ETL-to-SDP Refactor
+# ETL to Spark Declarative Pipelines Refactor
 
-Este skill convierte código ETL imperativo en Spark Declarative Pipelines.
-**No requiere LLM externo** — tú (Genie Code) ERES el motor de transcripción.
+Convierte pipelines imperativos en pipelines declarativos, testeables, documentados y operables.
 
-## Workflow Paso a Paso
+## Objetivo
 
-### Paso 1: Leer el Código Fuente
+El resultado debe:
 
-1. Pide al usuario que indique el notebook/archivo a refactorizar
-2. Usa `readAssetById` para leer el contenido completo
-3. Identifica:
-   - Fuentes de datos (tablas, archivos, APIs)
-   - Transformaciones (joins, aggregations, filters)
-   - Destinos (tablas Delta, archivos)
-   - Orquestación (loops, condicionales, dependencias entre pasos)
+- preservar la semántica del pipeline original;
+- reducir orquestación manual;
+- favorecer incrementalidad;
+- utilizar APIs modernas de Lakeflow pipelines;
+- aplicar calidad en el punto correcto;
+- mantener lógica de transformación testeable;
+- producir tablas documentadas para consumidores posteriores;
+- evitar introducir productos Databricks que el workload no necesita.
 
-### Paso 2: Preguntas de Clarificación (OBLIGATORIO)
+## Regla de plataforma
 
-Antes de generar código, SIEMPRE pregunta:
-
-```
-1. ¿Batch o Streaming? (¿Los datos llegan continuamente o se procesan por lotes?)
-2. ¿Medallion architecture? (¿Quieres Bronze → Silver → Gold o flat?)
-3. ¿Hay CDC/SCD? (¿Necesitas APPLY CHANGES para capturar cambios?)
-4. ¿Catálogo destino? (¿En qué catalog.schema quieres las tablas?)
-5. ¿Expectativas de calidad? (¿Qué reglas de validación aplican?)
-6. ¿Frecuencia de ejecución? (Continuo, triggered, scheduled?)
-```
-
-Si el código fuente ya deja claro alguno de estos puntos, no preguntes — infiere.
-
-### Paso 3: Mapeo de Patrones
-
-Usa esta tabla de equivalencias:
-
-| ETL Tradicional | SDP Equivalente |
-| --- | --- |
-| `spark.read.format("csv").load(path)` | `@dlt.table` + `spark.readStream.format("cloudFiles")` (Auto Loader) |
-| `spark.read.table("source")` | `@dlt.table` + `spark.read.table("source")` o `dlt.read("bronze_table")` |
-| `df.write.mode("overwrite").saveAsTable()` | `@dlt.table` (materialized view, auto-managed) |
-| `df.write.mode("append").saveAsTable()` | `@dlt.table` con streaming (streaming table) |
-| `MERGE INTO target USING source` | `dlt.apply_changes()` (CDC) |
-| `INSERT OVERWRITE partition` | `@dlt.table` con partition pruning natural |
-| Manual error handling (try/except) | `@dlt.expect*` decorators |
-| Orchestration notebook (dbutils.notebook.run) | Dependencias implícitas via `dlt.read()` |
-| `spark.sql("CREATE TABLE IF NOT EXISTS")` | Eliminado — SDP maneja DDL automáticamente |
-
-### Paso 4: Generar Código SDP
-
-Estructura del output:
+Para código nuevo utilizar:
 
 ```python
-# Pipeline: {nombre_descriptivo}
-# Refactorizado desde: {path_original}
-# Fecha: {fecha}
+from pyspark import pipelines as dp
+```
 
+No generar nuevo código basado en:
+
+```python
 import dlt
-from pyspark.sql.functions import *
+```
 
-# ═══════════════════════════════════════
-# BRONZE LAYER — Ingesta cruda
-# ═══════════════════════════════════════
+salvo que el usuario solicite explícitamente mantener sintaxis DLT legacy.
 
-@dlt.table(
-    comment="Ingesta cruda desde {fuente}",
-    table_properties={"quality": "bronze"}
+---
+
+# Workflow
+
+**Inspect → Model → Decide → Refactor → Test → Validate → Publish → Handoff**
+
+---
+
+## 1. Inspect: entender primero el pipeline existente
+
+Leer todo el código relevante antes de escribir la nueva implementación.
+
+Inventariar:
+
+```text
+Fuentes:
+- archivos
+- tablas
+- Kafka/event streams
+- bases de datos
+- APIs
+
+Destinos:
+- tablas
+- archivos
+- sistemas externos
+
+Transformaciones:
+- filters
+- joins
+- aggregations
+- deduplication
+- CDC
+- SCD
+- enrichment
+
+Estado:
+- checkpoints
+- watermarks
+- incremental cursors
+
+Orquestación:
+- notebooks
+- jobs
+- dependencies
+- loops
+- retries
+
+Calidad:
+- validaciones
+- asserts
+- quarantine
+- exception handling
+
+Consumidores:
+- dashboards
+- Genie Agents
+- ML
+- aplicaciones
+- exports
+```
+
+No empezar traduciendo línea por línea.
+
+---
+
+## 2. Model: reconstruir el DAG lógico
+
+Transformar la implementación actual en un grafo conceptual:
+
+```text
+source
+  ↓
+ingestion
+  ↓
+cleaning
+  ↓
+conformance
+  ↓
+business transformation
+  ↓
+serving
+```
+
+Para cada nodo registrar:
+
+```text
+Nombre:
+Fuente:
+Tipo de procesamiento:
+Grain:
+Keys:
+Incrementalidad:
+Output:
+Consumidores:
+Quality rules:
+```
+
+Detectar lógica duplicada y side effects.
+
+---
+
+## 3. Decide: separar ingestión de transformación cuando corresponda
+
+Por defecto, considerar:
+
+```text
+Pipeline A
+INGESTION / BRONZE
+        ↓
+Pipeline B
+TRANSFORMATION / SILVER + GOLD
+```
+
+Separarlos cuando:
+
+- ingestion debe continuar aunque falle una transformación downstream;
+- tienen schedules distintos;
+- requieren ownership diferente;
+- tienen SLAs diferentes;
+- necesitan ciclos de despliegue independientes.
+
+Mantenerlos juntos cuando la simplicidad operacional sea claramente superior y el DAG sea pequeño/cohesivo.
+
+No imponer Medallion Architecture sólo por convención.
+
+---
+
+## 4. Choose the correct dataset type
+
+### Streaming Table
+
+Preferir cuando:
+
+- la fuente es incremental o streaming;
+- se deben procesar nuevos registros conforme llegan;
+- existe checkpoint/state;
+- se consume CDC;
+- se necesita procesamiento incremental basado en offsets.
+
+Ejemplo:
+
+```python
+from pyspark import pipelines as dp
+
+@dp.table(
+    name="orders_bronze",
+    comment="Pedidos ingeridos incrementalmente desde archivos de origen."
 )
-def bronze_{nombre}():
+def orders_bronze():
     return (
-        spark.readStream.format("cloudFiles")
-        .option("cloudFiles.format", "{formato}")
-        .option("cloudFiles.schemaLocation", "{checkpoint}")
-        .load("{path}")
-    )
-
-# ═══════════════════════════════════════
-# SILVER LAYER — Limpieza y tipado
-# ═══════════════════════════════════════
-
-@dlt.table(comment="Datos limpios y tipados")
-@dlt.expect_or_drop("valid_id", "id IS NOT NULL")
-def silver_{nombre}():
-    return (
-        dlt.read_stream("bronze_{nombre}")
-        .select(
-            col("id").cast("long"),
-            # ... transformaciones del código original
-        )
-    )
-
-# ═══════════════════════════════════════
-# GOLD LAYER — Agregaciones de negocio
-# ═══════════════════════════════════════
-
-@dlt.table(comment="Métricas agregadas para reporting")
-def gold_{nombre}():
-    return (
-        dlt.read("silver_{nombre}")
-        .groupBy("dimension")
-        .agg(sum("metric").alias("total_metric"))
+        spark.readStream
+        .format("cloudFiles")
+        .option("cloudFiles.format", "json")
+        .load("/Volumes/production/landing/orders/")
     )
 ```
 
-### Paso 5: Orquestar Otros Skills (CRÍTICO)
+### Materialized View
 
-Después de generar el código base:
+Preferir cuando:
 
-1. **Carga `data-quality-expectations`** — Para agregar expectations estandarizadas:
-   - Pregunta al usuario qué reglas de calidad aplican
-   - Aplica el catálogo estándar de expectations del skill
-   - Agrega `@dlt.expect`, `@dlt.expect_or_drop`, `@dlt.expect_or_fail`
+- el resultado se define naturalmente como una consulta sobre el estado actual de sus fuentes;
+- Databricks puede administrar su refresh;
+- no existe necesidad semántica de tratar cada registro como evento incremental independiente.
 
-2. **Referencia `databricks-spark-declarative-pipelines`** (built-in) — Para:
-   - Sintaxis correcta de `apply_changes` (CDC/SCD Type 2)
-   - Configuración de pipeline (channel, photon, serverless)
-   - Patrones de Auto Loader avanzados
+Ejemplo:
 
-3. **Referencia `pipeline-error-handling-retry`** — Si el ETL original tenía:
-   - Try/except blocks
-   - Retry logic
-   - Dead letter patterns
-
-4. **Referencia `pipeline-observability-sla`** — Para agregar:
-   - Tags de monitoreo
-   - Integración con system tables para SLA tracking
-
-### Paso 6: Crear el Pipeline Asset
-
-Una vez aprobado el código:
-
-```
-1. Usa createAsset(assetType="pipeline", name="{nombre}") para crear el pipeline
-2. Navega con openAsset + continueMessage describiendo la estructura
-3. El pipeline editor agent completará la configuración (compute, catalog, channel)
-```
-
-## Decisiones Automáticas (no preguntar)
-
-| Si el código fuente tiene... | Entonces usa... |
-| --- | --- |
-| `.readStream` o streaming source | Streaming Table |
-| `.read` (batch) con aggregation | Materialized View |
-| `.read` (batch) sin aggregation | Streaming Table con `triggered` |
-| `MERGE INTO` con key columns | `apply_changes(keys=[...])` |
-| Multiple notebooks con `dbutils.notebook.run` | Un solo archivo SDP con dependencias `dlt.read()` |
-| Hardcoded paths `/mnt/...` | Volume paths `/Volumes/catalog/schema/volume/` |
-
-## Gotchas y Anti-patterns
-
-* **NO** conviertas `try/except` en código SDP — las expectations reemplazan error handling
-* **NO** uses `spark.sql("CREATE TABLE")` — SDP maneja DDL
-* **NO** mantengas `dbutils.widgets` — usa pipeline parameters en su lugar
-* **NO** uses `display()` — SDP no es interactivo
-* **CUIDADO** con UDFs — funcionan pero Photon no las optimiza, prefiere funciones built-in
-* **CUIDADO** con `.coalesce(1)` — SDP optimiza archivos automáticamente
-* Si el ETL original usa `foreachBatch`, evalúa si `apply_changes` o un simple streaming table lo reemplaza
-* Variables globales y state entre celdas → refactorizar como funciones independientes por tabla
-
-## Ejemplo Completo: De Imperativo a Declarativo
-
-### ANTES (ETL tradicional):
 ```python
-# Celda 1: Lectura
-df_raw = spark.read.format("csv").option("header", True).load("/mnt/data/sales/")
-df_raw.write.mode("overwrite").saveAsTable("default.raw_sales")
+from pyspark import pipelines as dp
+from pyspark.sql import functions as F
 
-# Celda 2: Limpieza
-df_clean = spark.table("default.raw_sales").filter("amount > 0").dropDuplicates(["order_id"])
-df_clean.write.mode("overwrite").saveAsTable("default.clean_sales")
-
-# Celda 3: Aggregation
-df_agg = spark.table("default.clean_sales").groupBy("region").agg(sum("amount").alias("total"))
-df_agg.write.mode("overwrite").saveAsTable("default.sales_by_region")
-```
-
-### DESPUÉS (SDP):
-```python
-import dlt
-from pyspark.sql.functions import *
-
-@dlt.table(comment="Ingesta incremental de ventas con Auto Loader")
-def bronze_sales():
+@dp.materialized_view(
+    name="sales_by_region",
+    comment="Ventas agregadas por región para consumo analítico."
+)
+def sales_by_region():
     return (
-        spark.readStream.format("cloudFiles")
-        .option("cloudFiles.format", "csv")
-        .option("cloudFiles.schemaHints", "amount DOUBLE, order_id STRING")
-        .load("/Volumes/catalog/schema/landing/sales/")
-    )
-
-@dlt.table(comment="Ventas validadas y deduplicadas")
-@dlt.expect_or_drop("positive_amount", "amount > 0")
-@dlt.expect("has_order_id", "order_id IS NOT NULL")
-def silver_sales():
-    return (
-        dlt.read_stream("bronze_sales")
-        .dropDuplicates(["order_id"])
-    )
-
-@dlt.table(comment="Ventas agregadas por región para dashboards")
-def gold_sales_by_region():
-    return (
-        dlt.read("silver_sales")
+        spark.read.table("orders_silver")
         .groupBy("region")
-        .agg(sum("amount").alias("total_sales"))
+        .agg(F.sum("amount").alias("total_sales"))
     )
 ```
 
-## Validación Post-Refactor
+### Temporary View
 
-Después de generar, verifica:
-- [ ] Todas las tablas destino del ETL original tienen equivalente SDP
-- [ ] No hay `spark.sql("CREATE/DROP")` residual
-- [ ] Auto Loader reemplaza lecturas batch de archivos
-- [ ] Expectations cubren las validaciones del try/except original
-- [ ] Paths usan `/Volumes/` en vez de `/mnt/` o `/dbfs/`
-- [ ] El catálogo/schema destino está configurado a nivel pipeline (no hardcoded)
+Usar para lógica intermedia que:
+
+- mejora legibilidad;
+- se reutiliza dentro del pipeline;
+- no necesita publicarse como activo persistente.
+
+### Append Flow
+
+Evaluar para:
+
+- múltiples fuentes escribiendo al mismo target;
+- backfills puntuales;
+- cargas `ONCE`.
+
+---
+
+## 5. CDC: usar AUTO CDC antes de MERGE imperativo
+
+Cuando el pipeline procesa cambios de registros:
+
+Identificar:
+
+```text
+Primary/business key:
+Sequence column:
+Delete semantics:
+SCD Type 1 o 2:
+Columns de historial:
+Out-of-order events:
+```
+
+Preferir AUTO CDC.
+
+Ejemplo conceptual:
+
+```python
+from pyspark import pipelines as dp
+
+dp.create_streaming_table(
+    name="customers_silver",
+    comment="Estado gobernado de clientes derivado del flujo CDC."
+)
+
+dp.create_auto_cdc_flow(
+    target="customers_silver",
+    source="customers_cdc_bronze",
+    keys=["customer_id"],
+    sequence_by="sequence_timestamp",
+    stored_as_scd_type=1
+)
+```
+
+No traducir `MERGE` a AUTO CDC automáticamente.
+
+Primero confirmar que el `MERGE` representa realmente change data capture.
+
+---
+
+## 6. Keep transformation logic testable
+
+Separar lógica PySpark pura del wrapper declarativo.
+
+Preferir:
+
+```python
+# transformations/orders.py
+
+from pyspark.sql import functions as F
+
+def clean_orders(df):
+    """Limpia y normaliza los pedidos recibidos."""
+    return (
+        df
+        .filter(F.col("order_id").isNotNull())
+        .withColumn("amount", F.col("amount").cast("decimal(18,2)"))
+    )
+```
+
+Pipeline:
+
+```python
+from pyspark import pipelines as dp
+from transformations.orders import clean_orders
+
+@dp.table(
+    name="orders_silver",
+    comment="Pedidos limpios y normalizados."
+)
+def orders_silver():
+    return clean_orders(
+        spark.readStream.table("orders_bronze")
+    )
+```
+
+Esto permite probar `clean_orders()` sin ejecutar un pipeline completo.
+
+---
+
+## 7. Convert data-quality logic deliberately
+
+Clasificar cada validación existente:
+
+```text
+WARN
+→ registrar violación pero conservar registro
+
+DROP
+→ registro inválido no debe llegar al target
+
+FAIL
+→ violación invalida el flujo
+```
+
+Ejemplo:
+
+```python
+from pyspark import pipelines as dp
+
+@dp.table(
+    name="orders_silver",
+    comment="Pedidos validados y preparados para consumo."
+)
+@dp.expect("order_id_presente", "order_id IS NOT NULL")
+@dp.expect_or_drop("amount_valido", "amount >= 0")
+def orders_silver():
+    return spark.readStream.table("orders_bronze")
+```
+
+No convertir todo `try/except` en una expectation.
+
+Expectations validan datos.
+
+No sustituyen:
+
+- retry de red;
+- manejo de credenciales;
+- errores de código;
+- recovery de checkpoint;
+- errores de infraestructura.
+
+---
+
+## 8. Quarantine when invalid data must be retained
+
+Cuando registros inválidos necesitan investigación o reparación:
+
+```text
+bronze
+  ├── valid → silver
+  └── invalid → quarantine
+```
+
+La cuarentena debe preservar al menos:
+
+```text
+registro original
+regla fallida
+source
+ingestion timestamp
+batch/flow context cuando esté disponible
+```
+
+No descartar datos silenciosamente.
+
+---
+
+## 9. Replace manual orchestration
+
+Revisar patrones como:
+
+```python
+dbutils.notebook.run(...)
+```
+
+y determinar si representan dependencias de datos.
+
+Cuando sí:
+
+Modelar las dependencias mediante lecturas entre datasets.
+
+No traducir simplemente una secuencia de notebooks en una secuencia idéntica de tasks.
+
+Primero comprobar si el DAG declarativo puede resolver la dependencia automáticamente.
+
+---
+
+## 10. Remove side effects from dataset functions
+
+Una función decorada por `@dp.table` o `@dp.materialized_view` debe definir un dataset.
+
+No incluir dentro de ella:
+
+- envío de emails;
+- REST calls arbitrarias;
+- escritura manual secundaria;
+- creación manual de tablas;
+- cambios de permisos;
+- lógica de observabilidad custom;
+- mutación de estado global.
+
+Las funciones de definición pueden evaluarse múltiples veces durante planning.
+
+---
+
+## 11. Evaluate managed ingestion first
+
+Si el pipeline imperativo existe sólo para copiar datos desde:
+
+- una base de datos;
+- una aplicación SaaS;
+- una fuente compatible con Lakeflow Connect;
+
+evaluar primero Lakeflow Connect.
+
+No reconstruir en SDP una integración que ya puede resolverse mediante una capa administrada.
+
+---
+
+## 12. AI Functions decision gate
+
+Cuando una transformación incluya:
+
+- clasificación de texto;
+- extracción de información;
+- resumen;
+- masking semántico;
+- generación o enriquecimiento con un modelo;
+
+evaluar primero Databricks AI Functions.
+
+Ejemplos de funciones a considerar según el workload:
+
+```text
+ai_classify
+ai_extract
+ai_summarize
+ai_mask
+ai_query
+```
+
+Antes de incorporarlas en un pipeline productivo validar:
+
+- calidad;
+- costo;
+- throughput;
+- latencia;
+- comportamiento ante NULL/error;
+- privacidad;
+- determinismo esperado.
+
+No utilizar una llamada LLM por fila en un pipeline de gran volumen sin evaluar primero estos factores.
+
+---
+
+## 13. Unity AI Gateway decision gate
+
+Si el pipeline llama directamente:
+
+- modelos externos;
+- model APIs;
+- agentes;
+- MCP servers;
+- herramientas AI externas;
+
+no almacenar credenciales del proveedor dentro del pipeline.
+
+Evaluar enrutar esas interacciones mediante Unity AI Gateway para:
+
+- control de acceso;
+- credenciales;
+- rate limits;
+- budgets;
+- observabilidad;
+- service policies.
+
+No activar este gate para un pipeline que sólo transforma datos.
+
+---
+
+## 14. Lakebase decision gate
+
+Si al revisar el ETL se descubre que una tabla Gold está siendo utilizada como sustituto de una base operacional para:
+
+- writes transaccionales;
+- estado de una aplicación;
+- sesiones;
+- agent state;
+- serving de baja latencia;
+- CRUD operacional;
+
+no seguir optimizando el pipeline como solución OLTP.
+
+Escalar el diseño para evaluar Lakebase Postgres.
+
+---
+
+## 15. Metadata is mandatory
+
+Toda tabla publicada para consumidores debe documentar:
+
+```text
+propósito
+grain
+source
+freshness
+owner/equipo
+campos de negocio críticos
+```
+
+Ejemplo:
+
+```sql
+COMMENT ON TABLE production.silver.orders IS
+  'Pedidos validados. Granularidad: una fila por pedido. Fuente: sistema de comercio electrónico.';
+
+COMMENT ON COLUMN production.silver.orders.order_id IS
+  'Identificador único del pedido en el sistema de origen.';
+```
+
+Los comentarios y documentación deben estar en español salvo solicitud explícita del usuario.
+
+No renombrar objetos productivos sólo para traducirlos.
+
+---
+
+## 16. Genie-readiness handoff
+
+Si el output alimenta consumo analítico:
+
+Antes de cerrar identificar:
+
+```text
+¿Estas tablas serán usadas por Genie?
+¿Tienen metadata suficiente?
+¿Qué preguntas busca responder el consumidor?
+¿Existen KPIs estables?
+¿Existen Metric Views?
+```
+
+El Data Engineer no debe inventar KPIs.
+
+Cuando existan necesidades de semántica o Genie:
+
+hacer handoff a:
+
+- `semantic-layer-strategy`
+- `self-service-analytics-enablement`
+
+---
+
+## 17. Test
+
+Realizar tres niveles cuando apliquen:
+
+### Unit tests
+Funciones PySpark puras.
+
+### Pipeline validation
+Validar código, dependencias y configuración.
+
+### Integration/data tests
+Comparar salida nueva vs pipeline anterior.
+
+Verificar:
+
+```text
+row counts
+keys
+aggregates
+duplicates
+NULL behavior
+CDC convergence
+late data
+schema
+critical business totals
+```
+
+---
+
+## 18. Migration strategy
+
+No reemplazar directamente producción.
+
+Preferir:
+
+```text
+legacy
+   ↓
+parallel run
+   ↓
+compare
+   ↓
+consumer validation
+   ↓
+cutover
+   ↓
+observation window
+   ↓
+retire legacy
+```
+
+La duración depende de criticidad y ciclo de datos.
+
+---
+
+## Output
+
+Entregar:
+
+```text
+Pipeline analizado:
+
+Arquitectura actual:
+- ...
+
+Arquitectura propuesta:
+- ...
+
+Datasets:
+- source:
+  target:
+  type:
+  incremental:
+  grain:
+
+CDC:
+- ...
+
+Expectations:
+- ...
+
+Quarantine:
+- ...
+
+Código modernizado:
+- ...
+
+Tests:
+- ...
+
+Metadata:
+- ...
+
+Handoffs:
+- Genie:
+- Metric Views:
+- Lakebase:
+- AI Gateway:
+
+Riesgos:
+- ...
+
+Plan de cutover:
+- ...
+```
+
+---
+
+# Definition of Done
+
+- [ ] Se inspeccionó todo el ETL relevante.
+- [ ] Se reconstruyó el DAG.
+- [ ] Se diferenciaron ingestion y transformation.
+- [ ] Cada dataset tiene el tipo correcto.
+- [ ] El código nuevo utiliza `pyspark.pipelines`.
+- [ ] Se eliminaron APIs DLT legacy salvo requerimiento explícito.
+- [ ] CDC utiliza AUTO CDC cuando corresponde.
+- [ ] Se eliminaron writes imperativos innecesarios.
+- [ ] Las transformaciones importantes son testeables.
+- [ ] Las reglas de calidad tienen semántica warn/drop/fail consciente.
+- [ ] Los registros que deben conservarse tienen quarantine.
+- [ ] No existen side effects dentro de dataset definitions.
+- [ ] Se evaluó Lakeflow Connect si existe un conector administrado.
+- [ ] Se evaluaron AI Functions si existe enriquecimiento IA.
+- [ ] Se evaluó Unity AI Gateway si existe tráfico AI externo.
+- [ ] Se evaluó Lakebase si apareció una necesidad OLTP.
+- [ ] Las tablas publicadas tienen metadata.
+- [ ] Comentarios, docstrings y documentación están en español.
+- [ ] Se realizó validación contra el pipeline anterior.
+- [ ] Existe plan de cutover.
+
+# Gotchas
+
+- DLT legacy sigue funcionando, pero no debe ser el default para código nuevo.
+- `@dp.table` y `@dp.materialized_view` tienen semánticas distintas.
+- No transformar automáticamente cualquier batch en streaming.
+- Expectations no sustituyen error handling de infraestructura.
+- AUTO CDC no sustituye cualquier MERGE.
+- Una migración técnicamente correcta puede cambiar grain o semántica.
+- No asumir que Medallion es obligatoria para todos los DAGs.
+- No mezclar código de monitoreo con dataset definitions.
+- No introducir llamadas externas por fila sin evaluar costo y resiliencia.

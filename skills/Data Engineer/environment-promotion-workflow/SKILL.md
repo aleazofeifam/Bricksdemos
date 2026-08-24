@@ -1,101 +1,470 @@
 ---
 name: environment-promotion-workflow
-description: Workflow de promoción de pipelines entre ambientes (dev→staging→prod) usando Databricks Asset Bundles, parametrización por target, y validación pre-deploy. Úsala cuando necesites mover código de desarrollo a producción de forma segura, repetible, y con rollback.
+description: Diseña promoción reproducible de proyectos Databricks entre development, staging y production mediante Declarative Automation Bundles, source control, testing, approvals y rollback seguro. Úsala para CI/CD de Lakeflow pipelines, Lakeflow Jobs, notebooks, SQL assets y otros recursos Databricks administrados como código.
 ---
 
-# Environment Promotion Workflow (Dev → Staging → Prod)
+# Environment Promotion Workflow
 
-Cómo estructurar y promover pipelines entre ambientes usando Declarative Automation Bundles (DABs).
+La unidad promovida debe ser una versión del proyecto, no cambios manuales dispersos.
 
-## Estructura de Bundle recomendada
+## Default lifecycle
 
+```text
+feature branch
+     ↓
+dev
+     ↓
+pull request
+     ↓
+automated tests
+     ↓
+staging
+     ↓
+integration validation
+     ↓
+approval
+     ↓
+production
+     ↓
+post-deploy validation
 ```
-my-project/
-├── databricks.yml          # Targets: dev, staging, prod
+
+---
+
+## 1. Inventory deployable resources
+
+Registrar:
+
+```text
+pipelines
+jobs
+source files
+libraries
+SQL assets
+alerts
+dashboards
+Genie Agents cuando formen parte del proyecto
+Lakebase resources cuando formen parte del proyecto
+```
+
+No intentar promover recursos desconocidos manualmente fuera del deployment definition.
+
+---
+
+## 2. Use Declarative Automation Bundles
+
+Estructura sugerida:
+
+```text
+project/
+├── databricks.yml
 ├── resources/
-│   ├── pipeline.yml        # DLT pipeline config
-│   └── job.yml             # Job orchestration
+│   ├── pipelines.yml
+│   └── jobs.yml
 ├── src/
-│   ├── bronze.py
-│   ├── silver.py
-│   └── gold.py
-└── tests/
-    └── integration_test.py
+│   ├── pipelines/
+│   └── transformations/
+├── tests/
+│   ├── unit/
+│   └── integration/
+└── README.md
 ```
 
-## databricks.yml con targets
+Adaptar al proyecto.
+
+No crear carpetas vacías únicamente para cumplir una plantilla.
+
+---
+
+## 3. Define environment targets
+
+Ejemplo conceptual:
 
 ```yaml
 bundle:
-  name: etl-pipeline
+  name: commerce-data-platform
 
 variables:
   catalog:
-    default: dev_catalog
-  schema:
-    default: etl
+    description: Catálogo utilizado por el ambiente.
 
 targets:
+
   dev:
     mode: development
     default: true
     variables:
-      catalog: dev_catalog
-    workspace:
-      host: https://dev-workspace.cloud.databricks.com
+      catalog: dev_commerce
 
   staging:
     variables:
-      catalog: staging_catalog
-    workspace:
-      host: https://staging-workspace.cloud.databricks.com
+      catalog: staging_commerce
 
   prod:
     mode: production
     variables:
       catalog: production
-    workspace:
-      host: https://prod-workspace.cloud.databricks.com
-    run_as:
-      service_principal_name: etl-prod-sp
 ```
 
-## CI/CD Flow
+Mantener diferencias de ambiente en configuración.
+
+No hardcodearlas en transformación.
+
+---
+
+## 4. Identity
+
+Producción debe ejecutarse mediante una identidad apropiada y estable.
+
+Preferir:
+
+- service principal;
+- workload identity;
+- least privilege.
+
+No depender de las credenciales personales de un desarrollador.
+
+---
+
+## 5. Secrets
+
+Nunca almacenar en Git:
+
+```text
+passwords
+PATs
+API keys
+database credentials
+model provider keys
+```
+
+Utilizar mecanismos administrados:
+
+- Unity Catalog Connections;
+- secret management;
+- identity federation;
+- environment configuration apropiada.
+
+---
+
+## 6. Unit tests
+
+Para Lakeflow pipelines:
+
+mantener lógica de transformación separada de decorators cuando sea posible.
+
+Ejemplo:
+
+```text
+pure PySpark function
+      ↓
+pytest/local test
+      ↓
+pipeline wrapper
+```
+
+Validar:
+
+- transformations;
+- edge cases;
+- schema expectations.
+
+---
+
+## 7. Static/deployment validation
+
+Antes de deploy:
 
 ```bash
-# 1. Develop locally
 databricks bundle validate --target dev
-databricks bundle deploy --target dev
-databricks bundle run --target dev etl_job
-
-# 2. PR merge → staging (CI)
-databricks bundle deploy --target staging
-databricks bundle run --target staging integration_tests
-
-# 3. Release → prod (CD, después de approval)
-databricks bundle deploy --target prod
 ```
 
-## Rollback
+Resolver errores antes de continuar.
+
+No utilizar production como entorno de validación sintáctica.
+
+---
+
+## 8. Development deployment
 
 ```bash
-# Opción 1: Re-deploy versión anterior
-git checkout <previous-tag>
-databricks bundle deploy --target prod
+databricks bundle deploy --target dev
+```
 
-# Opción 2: Destroy + redeploy (destructivo)
-databricks bundle destroy --target prod  # CUIDADO: borra recursos
-git checkout <previous-tag>
+Ejecutar pruebas necesarias.
+
+Validar:
+
+- DAG;
+- schemas;
+- quality;
+- permissions;
+- metadata.
+
+---
+
+## 9. Pull-request gate
+
+El PR debe revisar:
+
+```text
+code
+data contract changes
+schema changes
+permissions
+environment changes
+breaking changes
+dependencies
+```
+
+Para cambios sensibles documentar impacto downstream.
+
+---
+
+## 10. Staging
+
+Staging debe parecerse lo suficiente a production para encontrar incompatibilidades.
+
+Pero no copiar información sensible indiscriminadamente.
+
+Datos de staging pueden ser:
+
+- synthetic;
+- masked;
+- governed sample;
+- representative generated data;
+- approved subset.
+
+La decisión depende del tipo de test.
+
+---
+
+## 11. Integration tests
+
+Validar:
+
+```text
+pipeline execution
+expected tables
+schema
+quality
+row-level logic
+critical aggregates
+permissions
+external dependencies
+```
+
+No utilizar únicamente "job completed successfully".
+
+---
+
+## 12. Metadata validation
+
+Antes de production:
+
+verificar que nuevos assets tengan:
+
+```text
+comments
+owners
+domain information
+critical column documentation
+```
+
+El código y comentarios generados deben estar en español.
+
+---
+
+## 13. Production approval
+
+Para cambios de riesgo alto requerir un plan explícito:
+
+```text
+deployment
+expected impact
+validation
+rollback
+communication
+```
+
+No exigir approval humano para cada cambio trivial si el modelo operacional ya permite automated delivery segura.
+
+---
+
+## 14. Deploy production
+
+```bash
 databricks bundle deploy --target prod
 ```
 
-## Gotchas
+Después ejecutar solamente la operación necesaria.
 
-* `bundle deploy` NO hace rollback automático si falla mid-deploy. Si un recurso se crea pero otro falla, queda en estado inconsistente.
-* Los nombres de recursos DEBEN incluir `${bundle.target}` para evitar colisiones entre ambientes en el mismo workspace.
-* El catálogo de UC en dev vs prod requiere que el Service Principal tenga grants en AMBOS. Crear SP separados por ambiente.
-* Las pipelines DLT no soportan `bundle destroy` limpio — dejan tablas huérfanas en UC. Limpiar manualmente con `DROP TABLE`.
-* `mode: development` agrega prefijo `[dev ${user}]` a los nombres. NO usar en prod.
-* Para secrets: usar variables de entorno en CI o Databricks secret scopes. NUNCA hardcodear credenciales en el bundle YAML.
-* Git tag cada release a prod para rollback fácil: `git tag -a v1.2.3 -m "Prod release"`. El rollback es `git checkout v1.2.2` + redeploy.
-* Testing en staging debe usar datos REALES (subset) no synthetic. Copiar un sample de prod con `CREATE TABLE staging.test AS SELECT * FROM prod.table LIMIT 10000`.
+No asumir que deploy implica que los datos ya fueron recalculados correctamente.
+
+---
+
+## 15. Post-deploy validation
+
+Verificar:
+
+```text
+resource state
+pipeline update
+quality
+freshness
+critical business aggregates
+consumer access
+```
+
+---
+
+# Rollback
+
+## Code/config rollback
+
+Preferir:
+
+```text
+known good commit/tag
+     ↓
+deploy previous definition
+     ↓
+validate
+```
+
+## Data rollback
+
+Un redeploy de código no necesariamente revierte:
+
+- schema changes;
+- mutated data;
+- backfills;
+- permissions already changed.
+
+Diseñar recuperación separadamente.
+
+No utilizar:
+
+```bash
+databricks bundle destroy --target prod
+```
+
+como mecanismo normal de rollback.
+
+`destroy` es una operación destructiva de lifecycle, no un undo universal.
+
+---
+
+## 16. Database migration gate
+
+Si el bundle administra Lakebase:
+
+tratar database schema migration como una operación stateful separada.
+
+No asumir que rollback del Bundle revierte transacciones o schema.
+
+---
+
+## 17. Genie dependency gate
+
+Si un proyecto incluye un Genie Agent:
+
+promover primero sus dependencias:
+
+```text
+tables
+metadata
+Metric Views
+permissions
+```
+
+y después validar sus benchmark questions.
+
+No publicar el agente contra assets incompletos.
+
+---
+
+## 18. Production evidence
+
+Registrar:
+
+```text
+git commit
+release/tag
+bundle target
+deployment timestamp
+identity
+tests
+approval cuando aplica
+validation results
+```
+
+---
+
+## Output
+
+```text
+Project:
+
+Resources:
+- ...
+
+Targets:
+- dev
+- staging
+- prod
+
+Identity:
+- ...
+
+Testing:
+- unit:
+- integration:
+
+Promotion gates:
+- ...
+
+Breaking changes:
+- ...
+
+Deployment:
+- ...
+
+Post-deploy validation:
+- ...
+
+Rollback:
+- code:
+- data:
+
+Evidence:
+- ...
+```
+
+---
+
+# Definition of Done
+
+- [ ] Los assets están versionados.
+- [ ] Se utilizan Declarative Automation Bundles.
+- [ ] Las diferencias de ambiente están parametrizadas.
+- [ ] Producción usa identidad apropiada.
+- [ ] No existen secretos hardcoded.
+- [ ] Existen unit tests donde aportan valor.
+- [ ] Bundle validation pasa.
+- [ ] Staging usa datos gobernados.
+- [ ] Existen integration tests.
+- [ ] Se revisaron breaking changes.
+- [ ] Production tiene post-deploy validation.
+- [ ] Rollback de código y datos están diferenciados.
+- [ ] Existe evidencia de deployment.
+- [ ] Documentación está en español.
+
+# Gotchas
+
+- Deploy exitoso no significa pipeline correcto.
+- Rollback de código no deshace datos.
+- `bundle destroy` no es rollback.
+- Staging no justifica copiar PII de producción.
+- Un cambio declarativo puede ser destructivo si modifica estado.
+- No utilizar identidad personal para recursos productivos.

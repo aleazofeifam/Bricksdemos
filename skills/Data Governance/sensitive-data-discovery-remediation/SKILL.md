@@ -1,64 +1,571 @@
 ---
 name: sensitive-data-discovery-remediation
-description: Descubre datos sensibles a escala en Unity Catalog — escaneo automático con ai_classify + regex, clasificación por sensibilidad, y remediación (mask, restrict, tag). Úsala cuando necesites un inventario de PII/PHI/PCI en un catálogo completo o detectar columnas sensibles en tablas nuevas.
+description: Descubre, clasifica, valida y protege información sensible en Unity Catalog mediante Data Classification, governed tags, Custom Classifiers, ABAC, row filters y column masks. Úsala para inventarios de PII/PHI/PCI, clasificación continua, secure-by-default, remediación de datos sensibles, revisión de exposiciones o incorporación de nuevos dominios al modelo de protección.
 ---
 
 # Sensitive Data Discovery & Remediation
 
-Workflow para escanear, clasificar y remediar datos sensibles a escala.
+El objetivo no es encontrar columnas que "parecen sensibles".
 
-## Paso 1: Escaneo con regex + ai_classify
+El objetivo es crear un ciclo gobernado:
 
-```sql
--- Detectar columnas candidatas a PII por nombre
-SELECT table_catalog, table_schema, table_name, column_name
-FROM system.information_schema.columns
-WHERE table_catalog = 'production'
-  AND (column_name RLIKE '(?i)(email|phone|ssn|rut|curp|cpf|cedula|passport|credit_card|tarjeta)'
-       OR column_name RLIKE '(?i)(nombre|apellido|direccion|address|dob|birth)')
-ORDER BY table_schema, table_name;
+**Discover → Classify → Review → Protect → Validate → Monitor**
+
+---
+
+# 1. Define sensitivity taxonomy
+
+Antes del scan identificar:
+
+```text
+Regulatory categories:
+- PII
+- PHI
+- PCI
+- financial
+- credentials
+
+Organizational categories:
+- confidential
+- restricted
+- internal
+- public
+
+Custom identifiers:
+- employee_id
+- customer_account_id
+- partner_reference
 ```
 
-```sql
--- Confirmar con ai_classify en sample
-SELECT column_name,
-  ai_classify(
-    CONCAT('Column name: ', column_name, '. Sample values: ',
-           CONCAT_WS(', ', COLLECT_LIST(CAST(value AS STRING)))),
-    ARRAY('PII_email', 'PII_phone', 'PII_national_id', 'PII_name', 'PII_address', 'financial', 'not_sensitive')
-  ) AS classification
-FROM (
-  SELECT column_name, value
-  FROM table TABLESAMPLE (100 ROWS)
-  UNPIVOT (value FOR column_name IN (col1, col2, col3))
-)
-GROUP BY column_name
+No mezclar:
+
+```text
+regulatory classification
 ```
 
-## Paso 2: Remediar
+con:
 
-```sql
--- Aplicar mask automático a columnas PII detectadas
-CREATE OR REPLACE FUNCTION production.security.mask_pii(v STRING)
-RETURNS STRING
-RETURN CASE WHEN is_account_group_member('pii_readers') THEN v
-            ELSE CONCAT(LEFT(v, 2), '***', RIGHT(v, 2)) END;
-
-ALTER TABLE production.crm.customers
-  ALTER COLUMN email SET MASK production.security.mask_pii;
-ALTER TABLE production.crm.customers
-  ALTER COLUMN phone SET MASK production.security.mask_pii;
-
--- Tag para tracking
-ALTER TABLE production.crm.customers ALTER COLUMN email SET TAGS ('sensitivity' = 'confidential');
+```text
+business confidentiality tier
 ```
 
-## Gotchas
+---
 
-* ai_classify tiene costo por invocación — NO escanear todas las filas. Sample de 100 es suficiente para detección.
-* Regex de RUT chileno: `[0-9]{7,8}-[0-9Kk]`. CURP mexicano: `[A-Z]{4}[0-9]{6}[HM][A-Z]{5}[0-9A-Z]{2}`. CPF brasileño: `[0-9]{3}\.[0-9]{3}\.[0-9]{3}-[0-9]{2}`. Incluir patterns LATAM.
-* El escaneo debe ser INCREMENTAL (solo tablas nuevas/modificadas). Usar `last_altered` de information_schema.
-* Columnas con nombres genéricos (col_1, value, data) son candidatas — NO asumir que nombre = contenido.
-* La función de mask recibe el valor y DEBE devolver el MISMO tipo (STRING→STRING, no STRING→NULL).
-* El masking aplica en Genie, dashboards, views — no hay bypass accidental.
-* Coverage metric: `(columns_tagged / total_string_columns) * 100`. Target: >90% de tablas gold.
+# 2. Define scope
+
+Registrar:
+
+```text
+Catalog:
+Schemas:
+Countries:
+Data domains:
+Known sensitive systems:
+Compliance requirements:
+Consumers:
+```
+
+Country/context importa porque algunas categorías son regionales.
+
+---
+
+# 3. Use Data Classification first
+
+Cuando esté disponible:
+
+habilitar Databricks Data Classification para los catalogs correspondientes.
+
+La capacidad debe ser el default para:
+
+```text
+automatic discovery
+sensitive-column classification
+incremental scanning
+system governed tags
+coverage monitoring
+```
+
+No construir inicialmente una solución basada en SQL regex + LLM.
+
+---
+
+# 4. Review classification output
+
+Clasificación automática no equivale a decisión final de gobierno.
+
+Revisar:
+
+```text
+detected class
+confidence/context
+sample values when authorized
+false positives
+false negatives
+business context
+```
+
+No exponer sample values a usuarios que no necesitan acceso al contenido.
+
+---
+
+# 5. Understand system classification tags
+
+Data Classification puede aplicar governed tags del tipo:
+
+```text
+class.name
+class.email_address
+class.phone_number
+class.date_of_birth
+...
+```
+
+Utilizar estas tags como inputs para políticas.
+
+No duplicar automáticamente:
+
+```text
+class.email_address
+```
+
+con:
+
+```text
+sensitivity=email
+pii=email
+contains_email=true
+```
+
+sin una necesidad organizacional distinta.
+
+---
+
+# 6. Custom Classifiers
+
+Si un tipo de dato sensible específico no está cubierto:
+
+evaluar Custom Classifiers.
+
+Ejemplos:
+
+```text
+internal_employee_number
+insurance_policy_number
+customer_contract_code
+local proprietary identifier
+```
+
+Definir:
+
+```text
+governed tag
+description
+representative examples
+validation samples
+owner
+```
+
+Revisar falsos positivos antes de activar a escala.
+
+---
+
+# 7. AI Functions fallback
+
+AI Functions pueden complementar discovery cuando:
+
+- Data Classification no está disponible;
+- se realiza un POC;
+- existe una clasificación semántica muy específica;
+- se necesita enriquecer datos posteriormente.
+
+Evaluar, por ejemplo:
+
+```text
+ai_classify
+ai_extract
+ai_mask
+```
+
+según el problema.
+
+No usar `ai_classify` sobre todas las filas para descubrir PII.
+
+Eso:
+
+```text
+aumenta costo
+aumenta exposición
+puede ser innecesario
+```
+
+---
+
+# 8. Regex fallback
+
+Regex sigue siendo útil para:
+
+```text
+highly deterministic formats
+pre-screening
+validation
+known identifiers
+```
+
+Ejemplos:
+
+```text
+UUID-like identifiers
+country-specific fixed formats
+email syntax
+```
+
+Pero regex:
+
+```text
+nombre de columna
+```
+
+no demuestra contenido sensible.
+
+Combinar signals cuando corresponda.
+
+---
+
+# 9. Protect by policy, not manual repetition
+
+Para protección repetible a escala:
+
+preferir ABAC.
+
+Modelo:
+
+```text
+Data Classification
+       ↓
+governed class.* tags
+       ↓
+ABAC policy
+       ↓
+mask/filter
+```
+
+Esto evita configurar manualmente cada nueva columna.
+
+---
+
+# 10. Column masking
+
+Definir la política según:
+
+```text
+classification
+consumer identity
+purpose
+region
+consent
+clearance
+```
+
+La mask debe conservar un tipo compatible con la columna.
+
+No utilizar una única máscara parcial para todos los tipos de PII.
+
+Ejemplo:
+
+```text
+email
+→ masked email
+
+national ID
+→ redact
+
+DOB
+→ generalized/year only
+
+payment details
+→ strong redaction
+```
+
+según política organizacional.
+
+---
+
+# 11. Row filtering
+
+Utilizar cuando sensibilidad depende del registro.
+
+Ejemplos:
+
+```text
+country
+region
+tenant
+consent
+business unit
+```
+
+Preferir ABAC para políticas repetidas a escala.
+
+Utilizar table-level row filters para lógica verdaderamente local o cuando ABAC no corresponda.
+
+---
+
+# 12. Secure-by-default
+
+Para áreas donde tablas nuevas pueden contener información sensible:
+
+evaluar patrón:
+
+```text
+schema:
+review_status = pending
+
+new table
+      ↓
+restricted/masked by default
+      ↓
+Data Classification
+      ↓
+steward review
+      ↓
+review_status = reviewed
+      ↓
+normal ABAC classification policies
+```
+
+Esto reduce la ventana donde una tabla nueva puede quedar expuesta antes de ser clasificada.
+
+---
+
+# 13. Control tag permissions
+
+Los tags que activan seguridad son parte del security boundary.
+
+Definir:
+
+```text
+who can create governed tags
+who can assign
+who can remove
+who can manage policies
+```
+
+No dar `APPLY TAG` indiscriminadamente sobre tags que controlan masking.
+
+Un usuario capaz de quitar el tag puede modificar qué políticas se aplican.
+
+---
+
+# 14. Validate policy with identities
+
+Probar como mínimo roles representativos:
+
+```text
+authorized sensitive-data reader
+standard analyst
+data steward
+service principal
+Genie consumer
+```
+
+No validar sólo como admin.
+
+---
+
+# 15. Negative tests
+
+Probar explícitamente:
+
+```text
+SELECT sensitive column
+query through view
+query through dashboard
+query through Genie
+join against sensitive table
+access from unauthorized group
+```
+
+Esperar fallos o masks apropiados.
+
+---
+
+# 16. Genie
+
+La seguridad de Genie debe venir de Unity Catalog.
+
+Nunca utilizar una instrucción:
+
+```text
+"No le muestres información sensible a usuarios no autorizados"
+```
+
+como sustituto de access control.
+
+Si un usuario no puede acceder al dato, el control debe aplicarse en la capa de gobierno.
+
+---
+
+# 17. AI Gateway sensitive-content gate
+
+Cuando datos sensibles puedan entrar en:
+
+```text
+LLM requests
+agents
+MCP calls
+external tools
+```
+
+la clasificación de tablas no es suficiente.
+
+Evaluar Unity AI Gateway y service policies para gobernar el runtime de AI.
+
+Casos:
+
+```text
+PII in prompts
+prompt injection
+unsafe content
+unauthorized tools
+external provider routing
+```
+
+---
+
+# 18. Inference tables
+
+Si se habilitan AI Gateway inference tables:
+
+tratar request/response payloads como un dataset potencialmente sensible.
+
+Definir:
+
+```text
+access
+classification
+retention
+monitoring
+purpose
+```
+
+No habilitar logging completo por compliance sin considerar que el propio log puede contener PII.
+
+---
+
+# 19. Remediation modes
+
+Una detección puede producir:
+
+```text
+TAG
+MASK
+ROW FILTER
+REVOKE
+RELOCATE
+DELETE
+PSEUDONYMIZE
+INVESTIGATE
+```
+
+No asumir que toda PII debe borrarse.
+
+La acción depende de:
+
+```text
+purpose
+legal basis
+policy
+consumer
+retention
+```
+
+---
+
+# 20. Continuous classification
+
+Discovery no es un proyecto one-time.
+
+Monitorizar:
+
+```text
+new tables
+new columns
+classification changes
+unreviewed detections
+new sensitive domains
+custom classifier quality
+```
+
+Data Classification ya incorpora scanning incremental; aprovecharlo.
+
+---
+
+# Output
+
+```text
+Scope:
+
+Taxonomy:
+- ...
+
+Data Classification:
+- status:
+- coverage:
+
+Detections:
+- class:
+  assets:
+
+Custom classifiers:
+- ...
+
+False positives:
+- ...
+
+False negatives:
+- ...
+
+ABAC:
+- policies:
+
+Secure-by-default:
+- ...
+
+AI runtime exposure:
+- ...
+
+Remediation:
+P0:
+P1:
+P2:
+```
+
+# Definition of Done
+
+- [ ] Scope está definido.
+- [ ] Taxonomy está definida.
+- [ ] Se evaluó Data Classification antes de custom scanning.
+- [ ] Detections críticas fueron revisadas.
+- [ ] Custom Classifiers se evaluaron para categorías propias.
+- [ ] Governed tags son utilizados para security policy cuando corresponde.
+- [ ] Se evaluó ABAC.
+- [ ] Tag permissions están restringidos.
+- [ ] Se realizaron tests con identidades no-admin.
+- [ ] Se realizaron negative tests.
+- [ ] Genie depende de UC security.
+- [ ] Se evaluó AI Gateway para sensitive AI traffic.
+- [ ] Inference tables tienen policy de sensibilidad si se usan.
+- [ ] Existe continuous classification.
+- [ ] Documentación está en español.
+
+# Gotchas
+
+- Column name no demuestra sensitivity.
+- Classification automática necesita review para casos críticos.
+- Tag security depende de quién puede modificar el tag.
+- Masking no es lo mismo que erasure.
+- Genie instructions no son un security boundary.
+- Los logs de AI pueden ser tan sensibles como los datos originales.
+- No escanear todo el dataset con un LLM cuando existe clasificación administrada.
+
+Databricks incluso documenta un patrón secure-by-default: nuevas tablas heredan un estado pendiente, se protegen mientras Data Classification las analiza y sólo después del steward review pasan al estado revisado.

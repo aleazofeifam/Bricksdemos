@@ -1,50 +1,303 @@
 ---
 name: sql-performance-troubleshooting
-description: Diagnostica y resuelve queries SQL lentos en DBSQL — lectura de query profile, identificación de bottlenecks (scan, shuffle, spill), y acciones correctivas. Úsala cuando un reporte o dashboard exceda su SLA de tiempo de respuesta.
+description: Diagnostica y corrige consultas lentas en Databricks SQL mediante medición reproducible, Query Profile, análisis de scans, joins, shuffles, cardinalidad y layout físico. Se usa cuando una query, dashboard o workload SQL incumple su objetivo de latencia, costo o estabilidad.
 ---
 
 # SQL Performance Troubleshooting
 
-Workflow paso a paso para diagnosticar y resolver queries lentos.
+Optimiza mediante evidencia.
 
-## Proceso de diagnóstico
+Nunca comenzar aplicando `OPTIMIZE`, aumentando warehouse size o materializando una tabla sin identificar primero el bottleneck.
 
-1. **Abrir Query Profile** (SQL Editor → History → click en query → Profile tab)
-2. **Identificar operador más costoso** (% de tiempo en el plan)
-3. **Aplicar fix según bottleneck:**
+## Workflow
 
-| Bottleneck | Síntoma | Fix |
-|-----------|---------|-----|
-| Full Table Scan | Scan domina 80%+ del tiempo | Liquid clustering en columnas de filtro |
-| Shuffle | Exchange/Sort entre stages | Reducir JOINs o pre-agregar |
-| Spill to disk | Memory exceeded warnings | Aumentar warehouse size o reducir datos |
-| Planning time >5s | Muchas tablas/views | Simplificar, materializar CTEs |
+**Baseline → Profile → Hypothesis → Change → Re-measure → Keep/Revert**
 
-## Fixes comunes
+---
 
-```sql
--- Fix 1: Agregar liquid clustering
-ALTER TABLE production.gold.transactions CLUSTER BY (transaction_date, customer_id);
-OPTIMIZE production.gold.transactions;
+## 1. Establish the baseline
 
--- Fix 2: Materializar CTE pesado
-CREATE TABLE production.gold.pre_aggregated AS
-SELECT customer_id, DATE_TRUNC('MONTH', txn_date) AS month,
-  SUM(amount) AS monthly_total
-FROM production.gold.transactions
-GROUP BY customer_id, month;
+Registrar:
 
--- Fix 3: Filtro más selectivo
--- Antes (45s): WHERE year = 2026
--- Después (3s): WHERE transaction_date >= '2026-01-01' AND transaction_date < '2027-01-01'
+```text
+Query:
+Consumer:
+Warehouse:
+Tiempo observado:
+Objetivo:
+Filas retornadas:
+Frecuencia:
+Parámetros:
+Cache state:
+Costo/importancia:
 ```
+
+Ejecutar una medición reproducible.
+
+Evitar comparar una ejecución cacheada contra una no cacheada.
+
+---
+
+## 2. Open Query Profile
+
+Inspeccionar:
+
+- top operators;
+- filas procesadas;
+- filas producidas;
+- scans;
+- joins;
+- cardinalidad;
+- shuffles;
+- memory;
+- spill;
+- execution time;
+- performance insights.
+
+Buscar primero dónde se consume el tiempo.
+
+No optimizar basándose únicamente en el texto SQL.
+
+---
+
+## 3. Classify the bottleneck
+
+### Excessive scan
+
+Investigar:
+
+- filtros;
+- partition/data skipping behavior;
+- layout;
+- columnas innecesarias;
+- rango temporal.
+
+### Join explosion
+
+Comparar cardinalidad antes y después del join.
+
+Validar:
+
+- keys;
+- duplicados;
+- many-to-many;
+- grain.
+
+### Shuffle / aggregation
+
+Revisar:
+
+- cardinalidad de `GROUP BY`;
+- joins;
+- sorts;
+- ventanas;
+- agregaciones tempranas.
+
+### Spill
+
+Determinar si el problema es:
+
+- query shape;
+- cardinalidad;
+- skew;
+- volumen legítimo;
+- capacidad de compute.
+
+No aumentar compute antes de revisar la query.
+
+### Repeated expensive transformation
+
+Evaluar:
+
+- materialized view;
+- tabla curada;
+- simplificación upstream;
+- metric view materialization cuando aplique.
+
+---
+
+## 4. Check physical optimization
+
+Para Unity Catalog managed tables:
+
+1. revisar si predictive optimization está habilitado;
+2. revisar automatic liquid clustering cuando sea aplicable;
+3. revisar workload real;
+4. sólo después considerar ajustes manuales.
+
+No seleccionar clustering keys exclusivamente por intuición.
+
+---
+
+## 5. Check semantic duplication
+
+Si muchos dashboards ejecutan variaciones de la misma lógica:
+
+No limitar el análisis a optimizar cada query.
+
+Preguntar:
+
+- ¿debería existir una Metric View?
+- ¿debería existir una materialización compartida?
+- ¿existe una transformación repetida que pertenece upstream?
+
+---
+
+## 6. Use Genie Code as accelerator
+
+Cuando Query Profile ofrece una recomendación accionable, Genie Code puede ayudar a:
+
+- reescribir la consulta;
+- explicar un bottleneck;
+- proponer cambios.
+
+Revisar siempre el cambio antes de aceptarlo.
+
+No asumir que una query reescrita conserva automáticamente la misma semántica.
+
+---
+
+## 7. Change one thing at a time
+
+Ejemplo:
+
+```text
+Baseline:
+18.4 s
+
+Hipótesis:
+join multiplica cardinalidad.
+
+Cambio:
+deduplicar dimensión antes del join.
+
+Resultado:
+5.2 s
+
+Correctness:
+igual al resultado esperado.
+
+Decisión:
+mantener.
+```
+
+Evitar modificar simultáneamente:
+
+- warehouse;
+- query;
+- clustering;
+- materialización;
+
+porque después no será posible atribuir la mejora.
+
+---
+
+## 8. Validate correctness after optimization
+
+Performance no puede cambiar el resultado.
+
+Comparar:
+
+- row count;
+- aggregates;
+- NULL;
+- duplicates;
+- known test cases.
+
+Cuando sea posible, comparar automáticamente la versión anterior y la nueva.
+
+---
+
+## Output
+
+```text
+Baseline:
+
+Query Profile:
+- bottleneck:
+
+Hipótesis:
+
+Cambio:
+
+Resultado posterior:
+
+Mejora:
+
+Validación funcional:
+
+Decisión:
+- keep
+- revert
+- investigate further
+
+Siguiente bottleneck:
+- ...
+```
+
+---
+
+## Databricks decision gates
+
+### Query Profile
+
+Core.
+
+### Predictive Optimization / Automatic Liquid Clustering
+
+Revisar antes de introducir optimizaciones físicas manuales.
+
+### Genie Code
+
+Aplicable como acelerador de diagnóstico y reescritura.
+
+### Materialized Views
+
+Aplicables cuando existe cálculo costoso reutilizado.
+
+### Metric Views
+
+Aplicables cuando el problema incluye duplicación semántica, no como arreglo genérico de performance.
+
+### Spark Declarative Pipelines
+
+Si el verdadero fix pertenece upstream, delegar a Data Engineering.
+
+### Genie Agents
+
+No forzar.
+
+### Lakebase
+
+No forzar.
+
+### AI Functions
+
+No forzar salvo que el bottleneck sea específicamente un workload de AI Functions.
+
+### Unity AI Gateway
+
+No forzar.
+
+---
+
+## Definition of Done
+
+- [ ] Existe baseline reproducible.
+- [ ] Se inspeccionó Query Profile.
+- [ ] Se identificó una hipótesis.
+- [ ] Se aplicó un cambio controlado.
+- [ ] Se volvió a medir.
+- [ ] Se comprobó correctness.
+- [ ] Se documentó keep/revert.
+- [ ] Se evaluaron optimizaciones automáticas antes de manuales.
+- [ ] No se utilizaron thresholds arbitrarios como regla universal.
+- [ ] La explicación está documentada en español.
 
 ## Gotchas
 
-* Liquid clustering NO es inmediato. Se aplica en el próximo OPTIMIZE, no en la próxima query.
-* El Query Profile muestra planificación separada de ejecución. Si planning >5s: demasiadas tablas en el plan.
-* El caching de DBSQL funciona por result hash. Si cambias un parámetro, no cachea.
-* Para queries >30 minutos: considerar materialized view en vez de query directa.
-* `EXPLAIN ANALYZE` da el plan real (con datos), no solo estimado. Siempre preferir sobre `EXPLAIN` solo.
-* Photon requiere warehouse Medium o superior. En Small no hay Photon available.
-* Clustering columns: elegir las MÁS usadas en WHERE (max 4). Más de 4 no ayuda.
+- Una query cacheada puede invalidar una comparación.
+- Un join correcto sintácticamente puede provocar explosión de cardinalidad.
+- Más compute puede ocultar una query incorrectamente diseñada.
+- La materialización puede reducir latencia pero introducir costo y frescura.
+- Optimizar performance sin validar resultados puede producir una query rápidamente incorrecta.

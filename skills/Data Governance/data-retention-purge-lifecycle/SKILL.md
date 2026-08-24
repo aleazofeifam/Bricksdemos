@@ -1,72 +1,531 @@
 ---
 name: data-retention-purge-lifecycle
-description: Implementa políticas de retención y eliminación de datos en Delta/UC — TTL por tabla, purge schedule, GDPR right-to-erasure, y archivado a cold storage. Úsala cuando necesites borrar datos por compliance, controlar storage, o implementar data lifecycle management.
+description: Diseña y ejecuta lifecycle de retención, archivado y eliminación para datos y logs gobernados, distinguiendo política legal/empresarial de mecanismos técnicos Delta, upstream sources, AI logs y sistemas operacionales. Úsala para retention policies, right-to-erasure workflows, legal hold, data minimization, archival, storage lifecycle o eliminación física verificable.
 ---
 
 # Data Retention & Purge Lifecycle
 
-Políticas de retención, eliminación, y archivado de datos.
+Retention es una decisión de política.
 
-## Clasificación por retention tier
+Purge es una implementación técnica.
 
-| Tier | Retención | Ejemplo | Acción al vencer |
-|------|----------|---------|------------------|
-| Hot | 90 días | Logs operativos | DELETE + VACUUM |
-| Warm | 1 año | Transacciones | ARCHIVE (Deep Clone) |
-| Cold | 5 años | Compliance/legal | Move to Glacier |
-| Permanent | Indefinido | Datos maestros | Nunca borrar |
+Nunca inventar la primera a partir de la segunda.
 
-## Implementación: Job de retention diario
+---
 
-```sql
--- Paso 1: DELETE filas vencidas
-DELETE FROM production.ops.application_logs
-WHERE log_date < CURRENT_DATE() - INTERVAL 90 DAYS;
+# Core workflow
 
--- Paso 2: OPTIMIZE para compactar
-OPTIMIZE production.ops.application_logs
-WHERE log_date >= CURRENT_DATE() - INTERVAL 90 DAYS;
+**Inventory → Policy → Dependencies → Protect/Hold → Delete/Archive → Physically Purge → Verify → Evidence**
 
--- Paso 3: VACUUM para liberar storage
-VACUUM production.ops.application_logs RETAIN 168 HOURS;
+---
+
+# 1. Identify policy authority
+
+Antes de eliminar registrar:
+
+```text
+Policy:
+Legal/regulatory source:
+Business owner:
+Privacy/Legal approval if required:
+Data category:
+Jurisdiction:
+Retention period:
+Trigger:
+Exceptions:
+Legal hold:
 ```
 
-## GDPR Right to Erasure (borrado completo)
+No utilizar períodos universales.
 
-```sql
--- 1. Borrar de todas las tablas
-DELETE FROM production.gold.customers WHERE user_id = 'ERASURE-REQUEST-456';
-DELETE FROM production.gold.orders WHERE customer_id = 'ERASURE-REQUEST-456';
-DELETE FROM production.gold.interactions WHERE user_id = 'ERASURE-REQUEST-456';
+---
 
--- 2. PURGE de time travel (elimina de versiones históricas)
-REORG TABLE production.gold.customers APPLY (PURGE);
-REORG TABLE production.gold.orders APPLY (PURGE);
+# 2. Classify the requirement
 
--- 3. Registrar para compliance
-INSERT INTO production.compliance.erasure_audit
-VALUES ('ERASURE-REQUEST-456', CURRENT_TIMESTAMP(), CURRENT_USER(), 'completed');
+```text
+RETENTION
+→ keep for defined period
+
+MINIMIZATION
+→ don't keep unnecessary data
+
+ARCHIVE
+→ preserve outside active workload
+
+ERASURE
+→ remove specified subject/data
+
+LEGAL HOLD
+→ suspend deletion
+
+TECHNICAL CLEANUP
+→ storage optimization
 ```
 
-## Archivado a cold storage
+No confundir storage cleanup con compliance erasure.
 
-```sql
--- Deep Clone a external location con lifecycle policy
-CREATE TABLE archive.cold.transactions_2024
-  DEEP CLONE production.gold.transactions
-  LOCATION 's3://archive-bucket/transactions/2024/';
+---
 
--- Después de validar el archive:
-DELETE FROM production.gold.transactions
-WHERE transaction_date < '2025-01-01';
+# 3. Inventory every copy
+
+Buscar:
+
+```text
+source systems
+bronze
+silver
+gold
+views/materializations
+feature tables
+training datasets
+exports
+volumes
+Delta history
+backups/archive
+Lakebase
+inference tables
+MLflow traces/artifacts
+other systems
 ```
 
-## Gotchas
+No ejecutar erasure únicamente sobre Gold.
 
-* `VACUUM RETAIN 0 HOURS` requiere `SET spark.databricks.delta.retentionDurationCheck.enabled = false`. PELIGROSO si hay queries concurrentes.
-* REORG PURGE es la forma SEGURA de eliminar tombstones de time travel post-DELETE.
-* Delta time travel mantiene datos BORRADOS accesibles por default 7 días. Para GDPR estricto: esto es retención ilegal si no se purga.
-* Archivado a cold: usar DEEP CLONE (no SHALLOW CLONE) — Deep Clone copia datos físicamente, Shallow solo referencia.
-* El job de retention debe correr en OFF-PEAK hours para no impactar queries de BI.
-* Mantener registro de TODAS las eliminaciones para audit trail (tabla de erasure_audit).
-* Following workspace policies: use RemoveAfter tags on all resources to signal retention expectations.
+---
+
+# 4. Lineage
+
+Utilizar lineage para identificar downstream copies.
+
+Complementar con:
+
+```text
+external systems
+manual exports
+shares
+archives
+application databases
+```
+
+Lineage no garantiza inventario absoluto de todo lo que salió de la plataforma.
+
+---
+
+# 5. Data subject identifier
+
+Para subject erasure definir exactamente:
+
+```text
+canonical ID
+alternate IDs
+email/phone mappings
+account IDs
+cross-system mapping
+```
+
+No buscar únicamente por email si existen múltiples identifiers.
+
+---
+
+# 6. Legal hold gate
+
+Antes de borrar verificar:
+
+```text
+legal hold?
+investigation hold?
+regulatory retention?
+litigation?
+financial record requirement?
+```
+
+Si existe conflicto:
+
+escalar a Legal/Compliance.
+
+No resolverlo automáticamente.
+
+---
+
+# 7. Logical deletion
+
+Para Delta:
+
+ejecutar únicamente después de delimitar scope.
+
+Ejemplo conceptual:
+
+```sql
+DELETE FROM production.commerce.customers
+WHERE customer_id = :customer_id;
+```
+
+Utilizar parámetros.
+
+No insertar identificadores sensibles directamente en logs o comentarios.
+
+---
+
+# 8. Understand deletion vectors
+
+Cuando deletion vectors u otras metadata-only deletes aplican:
+
+el DELETE lógico puede no reescribir inmediatamente el archivo físico.
+
+Para physical purge puede requerirse:
+
+```text
+DELETE
+    ↓
+REORG TABLE ... APPLY (PURGE)
+    ↓
+VACUUM
+```
+
+---
+
+# 9. REORG APPLY PURGE
+
+`REORG TABLE ... APPLY (PURGE)`:
+
+```text
+rewrites current data files
+to apply soft deletes
+```
+
+Pero archivos históricos anteriores todavía pueden contener los datos.
+
+No afirmar que REORG por sí solo completa physical erasure.
+
+---
+
+# 10. VACUUM
+
+`VACUUM` elimina archivos que:
+
+```text
+are no longer referenced
++
+meet retention eligibility
+```
+
+Antes de modificar retention revisar:
+
+```text
+long-running readers
+streaming
+Time Travel requirements
+rollback requirements
+concurrency
+legal retention
+```
+
+No recomendar `VACUUM RETAIN 0 HOURS` como workflow estándar.
+
+---
+
+# 11. Managed vs external assets
+
+Para managed tables:
+
+Unity Catalog controla mayor parte del data-file lifecycle.
+
+Para external tables:
+
+storage lifecycle también depende del sistema/cloud owner.
+
+No asumir que:
+
+```text
+DROP TABLE
+```
+
+borra physical data de una external table.
+
+---
+
+# 12. Archive decision
+
+Archivar únicamente cuando policy exige conservar.
+
+Opciones dependen de:
+
+```text
+queryability
+cost
+immutability
+retention
+security
+future restoration
+```
+
+No utilizar DEEP CLONE como política universal de archival.
+
+Puede crear otra copia que también deba gobernarse y eventualmente borrarse.
+
+---
+
+# 13. Archive governance
+
+Todo archive necesita:
+
+```text
+owner
+classification
+retention
+access
+encryption
+location
+destruction date/condition
+```
+
+"No está en production" no significa "no está regulado".
+
+---
+
+# 14. Upstream deletion
+
+Para privacy erasure revisar fuentes:
+
+```text
+Kafka
+operational DB
+files
+SaaS
+Lakebase
+landing zone
+```
+
+Si se borra sólo en Databricks y el pipeline vuelve a ingerir desde source, el dato puede reaparecer.
+
+---
+
+# 15. Pipeline behavior
+
+Antes de borrar comprobar:
+
+```text
+Will pipeline recreate the row?
+Will CDC send it again?
+Does source emit deletes?
+Will a full refresh restore it?
+```
+
+El deletion workflow debe sobrevivir futuros refresh/backfills.
+
+---
+
+# 16. SDP implications
+
+Si un dataset lo administra Spark Declarative Pipelines:
+
+coordinar deletion/backfill con Data Engineer.
+
+No mutar arbitrariamente una target table administrada por pipeline sin entender el siguiente refresh.
+
+---
+
+# 17. Lakebase gate
+
+Si datos regulados están en Lakebase:
+
+definir deletion mediante semántica PostgreSQL/aplicación correspondiente.
+
+No asumir que:
+
+```text
+REORG/VACUUM
+```
+
+aplica a Lakebase.
+
+Crear una única evidence chain para todos los stores involucrados.
+
+---
+
+# 18. AI Gateway inference tables
+
+Si AI requests/responses contienen el subject data:
+
+incluir inference tables en el inventario.
+
+Estas tablas pueden contener:
+
+```text
+prompt
+response
+requester
+request tags
+destination
+```
+
+y requieren su propia retention policy.
+
+---
+
+# 19. MLflow and agent traces
+
+Si GenAI traces almacenan contenido sensible:
+
+evaluar también:
+
+```text
+MLflow traces
+evaluation datasets
+training datasets
+artifacts
+feedback
+```
+
+Erasure puede requerir revisar esos activos.
+
+---
+
+# 20. Model-training implications
+
+Si información eliminada fue utilizada para entrenar un modelo:
+
+no afirmar automáticamente que eliminar el training row equivale a eliminar su influencia del modelo.
+
+Escalar a:
+
+```text
+Privacy
+Legal
+ML governance
+```
+
+según requirement.
+
+---
+
+# 21. Evidence
+
+Para una deletion operation registrar:
+
+```text
+request/reference
+scope
+systems checked
+objects modified
+operations
+timestamps
+validation
+operator
+exceptions
+```
+
+Evitar almacenar en el evidence log más PII de la necesaria.
+
+---
+
+# 22. Verification
+
+Verificar:
+
+```text
+active tables
+historical availability where applicable
+upstream source
+archive
+AI logs
+operational store
+reingestion behavior
+```
+
+No marcar completed sólo porque `DELETE` devolvió éxito.
+
+---
+
+# 23. Retention automation
+
+Automatizar únicamente policies aprobadas.
+
+Configurar:
+
+```text
+scope
+schedule
+owner
+dry-run/report
+failure handling
+legal-hold exclusions
+evidence
+```
+
+No hardcodear días en múltiples jobs.
+
+Centralizar policy metadata cuando sea viable.
+
+---
+
+# Output
+
+```text
+Requirement:
+- retention
+- erasure
+- archive
+- legal hold
+
+Authority:
+- ...
+
+Data subject/category:
+- ...
+
+Inventory:
+- source:
+- Delta:
+- archives:
+- Lakebase:
+- AI logs:
+- ML artifacts:
+
+Policy:
+- ...
+
+Operations:
+- ...
+
+Physical purge:
+- ...
+
+Verification:
+- ...
+
+Exceptions:
+- ...
+
+Evidence:
+- ...
+```
+
+# Definition of Done
+
+- [ ] Policy authority está identificada.
+- [ ] Retention no fue inventada por la skill.
+- [ ] Legal hold fue revisado.
+- [ ] Se identificaron todos los stores razonables.
+- [ ] Upstream sources fueron revisados.
+- [ ] Lineage fue utilizado.
+- [ ] Managed/external lifecycle está entendido.
+- [ ] REORG y VACUUM se utilizaron con semántica correcta cuando aplican.
+- [ ] Pipeline reingestion fue revisado.
+- [ ] Lakebase fue considerado cuando aplica.
+- [ ] AI Gateway inference tables fueron consideradas.
+- [ ] ML/agent artifacts fueron considerados cuando aplica.
+- [ ] Erasure fue verificada.
+- [ ] Evidence minimiza PII.
+- [ ] Documentación está en español.
+
+# Gotchas
+
+- DELETE lógico no siempre implica physical erasure inmediato.
+- REORG APPLY PURGE no elimina por sí solo todos los old files.
+- VACUUM puede destruir Time Travel.
+- DROP de external table no necesariamente borra storage.
+- Archive crea otra copia gobernable.
+- Full refresh puede volver a introducir datos borrados.
+- Borrar training data no equivale automáticamente a "untraining" de un modelo.
+
+La documentación oficial de Databricks confirma explícitamente el orden REORG TABLE ... APPLY (PURGE) y luego VACUUM cuando se necesita eliminar físicamente información registrada mediante soft deletes/deletion vectors.

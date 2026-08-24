@@ -1,69 +1,468 @@
 ---
 name: backfill-reprocessing-patterns
-description: Reprocesar datos históricos sin duplicar ni perder estado del streaming. Patrones de backfill para Delta, DLT, y Structured Streaming — full refresh selectivo, merge incremental, checkpoint reset seguro. Úsala cuando un pipeline requiera re-calcular datos pasados por bug fix, schema change, o nueva lógica de transformación.
+description: Planifica y ejecuta backfills, replay y reprocessing histórico de pipelines sin introducir duplicados, pérdida de datos o cambios downstream inesperados. Úsala después de bugs de transformación, lógica nueva, datos faltantes, cambios de schema, correcciones históricas, necesidad de replay o recuperación de streaming state.
 ---
 
 # Backfill & Reprocessing Patterns
 
-Cómo reprocesar datos históricos de forma segura sin duplicar, sin perder streaming state, y sin romper downstream.
+Un backfill es una operación de migración sobre datos existentes.
 
-## Decision Framework
+Tratarlo como operación potencialmente destructiva.
 
-| Escenario | Estrategia | Riesgo |
-|-----------|-----------|--------|
-| Bug en transformación (silver/gold) | MERGE overwrite parcial | Bajo |
-| Schema change en source | Full refresh DLT + revalidar | Medio |
-| Nueva lógica completa | Tabla nueva + swap | Bajo |
-| Streaming con checkpoint corrupto | Clone checkpoint + reset offset | Alto |
+## Core workflow
 
-## Patrón 1: MERGE Overwrite Parcial (recomendado)
+**Diagnose → Scope → Protect → Plan → Validate → Execute → Reconcile → Observe**
 
-```sql
--- Re-calcular últimos 30 días de silver desde bronze
-MERGE INTO production.silver.orders AS target
-USING (
-  SELECT * FROM production.bronze.raw_orders
-  WHERE order_date >= CURRENT_DATE() - INTERVAL 30 DAYS
-) AS source
-ON target.order_id = source.order_id
-WHEN MATCHED THEN UPDATE SET *
-WHEN NOT MATCHED THEN INSERT *;
+Nunca empezar ejecutando `MERGE`, full refresh o reset de checkpoint.
+
+---
+
+## 1. Diagnose the reason
+
+Clasificar:
+
+```text
+A. Missing historical data
+B. Transformation bug
+C. New business logic
+D. Schema correction
+E. Source correction
+F. CDC correction
+G. Invalid/corrupted streaming checkpoint
+H. Late-arriving data
 ```
 
-## Patrón 2: Full Refresh selectivo en DLT
+La causa determina la estrategia.
+
+---
+
+## 2. Identify affected layer
+
+```text
+Bronze
+Silver
+Gold
+Semantic layer
+Multiple layers
+```
+
+Preguntar:
+
+**¿El dato original todavía existe?**
+
+Esto es crítico antes de cualquier full refresh.
+
+---
+
+## 3. Define the scope
+
+Registrar:
+
+```text
+Target:
+Date/key range:
+Expected records:
+Source:
+Current downstream consumers:
+Streaming readers:
+Business criticality:
+Allowed downtime:
+```
+
+Evitar términos ambiguos como:
+
+```text
+"reprocesar los datos recientes"
+```
+
+Definir rangos concretos.
+
+---
+
+## 4. Inspect source durability
+
+Para streaming verificar:
+
+```text
+Kafka/event retention
+source files retention
+CDC log retention
+bronze history
+Delta history
+```
+
+No realizar full refresh cuando el source ya no contiene los datos requeridos para reconstruir el target.
+
+---
+
+## 5. Protect current state
+
+Antes de operaciones de riesgo registrar:
+
+```text
+Delta table version
+pipeline update ID
+row counts
+critical aggregates
+timestamp
+```
+
+Cuando criticidad lo requiera, crear una estrategia de backup compatible con el workload.
+
+No copiar terabytes automáticamente sólo por precaución.
+
+---
+
+# Decision framework
+
+## Pattern A: ONE-TIME append backfill
+
+Preferir cuando se necesita agregar datos históricos a una streaming table sin reconstruirla.
+
+Ejemplo:
 
 ```python
-# En el pipeline DLT, usar FULL REFRESH solo en la tabla afectada:
-# UI: Pipeline > Select table > "Full refresh"
-# CLI: databricks pipelines start-update --pipeline-id <ID> --full-refresh-selection "silver_orders"
+from pyspark import pipelines as dp
+
+@dp.table(
+    name="events",
+    comment="Eventos consolidados del sistema."
+)
+def events():
+    return (
+        spark.readStream
+        .format("cloudFiles")
+        .option("cloudFiles.format", "json")
+        .load("/Volumes/production/events/current/")
+    )
+
+@dp.append_flow(
+    target="events",
+    name="historical_backfill",
+    once=True
+)
+def historical_backfill():
+    return (
+        spark.read
+        .format("json")
+        .load("/Volumes/production/events/backfill/")
+    )
 ```
 
-## Patrón 3: Tabla nueva + swap (zero-downtime)
+El `once=True` vuelve a ejecutarse después de un full refresh.
+
+Tenerlo en cuenta.
+
+---
+
+## Pattern B: Recompute a Materialized View
+
+Para una materialized view cuya lógica cambió:
+
+considerar primero refresh normal.
+
+Lakeflow puede determinar incrementalización cuando sea apropiado.
+
+Utilizar full refresh sólo cuando se necesite explícitamente recalcular todo.
+
+---
+
+## Pattern C: Full refresh
+
+Aplicar únicamente cuando:
+
+- el source conserva todo lo necesario;
+- el costo es aceptable;
+- reconstruir target es semánticamente correcto.
+
+Para streaming table, full refresh:
+
+- elimina datos actuales del target;
+- elimina checkpoints;
+- reprocesa el source.
+
+Esto puede perder historia si el source ya expiró.
+
+---
+
+## Pattern D: Selective checkpoint reset
+
+Utilizar para recuperación/replay de streaming cuando:
+
+- es necesario preservar los datos actuales;
+- existe una posición confiable para reanudar/replay;
+- el sink es idempotente;
+- se ha comprendido el efecto del replay.
+
+Utilizar mecanismos soportados por Lakeflow pipelines.
+
+No modificar manualmente archivos internos del checkpoint.
+
+---
+
+## Pattern E: New table + validation + cutover
+
+Preferir cuando:
+
+- cambia fuertemente la semántica;
+- se modifica grain;
+- hay alto riesgo downstream;
+- se necesita comparar old/new;
+- el backfill es muy grande.
+
+Patrón:
+
+```text
+target_v1
+   ↓
+
+build target_v2
+   ↓
+validate
+   ↓
+consumer validation
+   ↓
+cutover
+   ↓
+observe
+   ↓
+retire v1
+```
+
+No hacer rename/swap sin revisar dependencias y contratos.
+
+---
+
+## Pattern F: Targeted correction
+
+Para corrections idempotentes sobre tablas Delta no administradas por un flujo que deba preservar su ownership:
+
+evaluar:
+
+- MERGE;
+- replaceWhere;
+- partition overwrite;
+- transaction.
+
+Seleccionar por semántica.
+
+No usar MERGE sólo porque "es incremental".
+
+---
+
+## 6. Idempotency
+
+Antes de ejecutar responder:
+
+```text
+¿Qué ocurre si el backfill corre dos veces?
+```
+
+La respuesta deseada suele ser:
+
+```text
+el resultado final no cambia
+```
+
+Validar:
+
+- business keys;
+- sequence;
+- merge semantics;
+- deduplication;
+- AUTO CDC;
+- append behavior.
+
+---
+
+## 7. Impact analysis
+
+Revisar:
+
+```text
+downstream streaming
+materialized views
+Metric Views
+dashboards
+Genie Agents
+models
+exports
+applications
+```
+
+Un backfill puede producir:
+
+- cambios históricos visibles;
+- nuevos registros;
+- métricas diferentes;
+- downstream spikes.
+
+Notificar a owners relevantes antes de operaciones críticas.
+
+---
+
+## 8. Dry validation
+
+Antes de escribir calcular:
+
+```text
+expected rows
+affected keys
+expected aggregates
+date range
+invalid records
+duplicates
+```
+
+Ejemplo:
 
 ```sql
--- 1. Crear tabla nueva con lógica corregida
-CREATE TABLE production.silver.orders_v2 AS
-SELECT ... FROM production.bronze.raw_orders;
-
--- 2. Validar counts y checksums
-SELECT 'v1' AS version, COUNT(*) FROM production.silver.orders
-UNION ALL
-SELECT 'v2', COUNT(*) FROM production.silver.orders_v2;
-
--- 3. Swap atómico
-ALTER TABLE production.silver.orders RENAME TO production.silver.orders_deprecated;
-ALTER TABLE production.silver.orders_v2 RENAME TO production.silver.orders;
-
--- 4. Limpiar después de validar downstream (7 días)
-DROP TABLE production.silver.orders_deprecated;
+SELECT
+    MIN(order_date) AS desde,
+    MAX(order_date) AS hasta,
+    COUNT(*) AS registros,
+    COUNT(DISTINCT order_id) AS pedidos
+FROM source
+WHERE order_date BETWEEN :start_date AND :end_date;
 ```
 
-## Gotchas
+---
 
-* En DLT, `FULL REFRESH` borra TODO el historial de la tabla (no es selectivo por partición). Para backfill parcial, usa MERGE externo al pipeline.
-* Streaming checkpoints son BINARIOS — no editables a mano. Si necesitas reset: clonar el directorio de checkpoint y borrar el `offsets/` file para reiniciar desde cero.
-* Después de un MERGE masivo, ejecutar `OPTIMIZE` para evitar small files.
-* SIEMPRE validar count + checksum antes vs después del backfill. Fórmula: `SELECT COUNT(*), SUM(hash(order_id, amount)) FROM table`.
-* Notificar downstream ANTES de un backfill grande — puede causar spikes de procesamiento en pipelines que leen la tabla.
-* Delta Time Travel permite ver el estado pre-backfill: `SELECT * FROM table VERSION AS OF <pre_version>` — útil para debugging post-backfill.
-* Para streaming: el backfill NO se propaga automáticamente por streaming readers (solo ven appends nuevos). Usar `FULL REFRESH` en DLT streaming table o re-crear el reader.
+## 9. Execute in bounded scope
+
+Cuando sea posible:
+
+- empezar por pequeño rango;
+- validar;
+- ampliar.
+
+No convertir un backfill controlable en un full-table operation innecesario.
+
+---
+
+## 10. Reconcile
+
+Después:
+
+### Volume
+
+```text
+before
+expected delta
+after
+```
+
+### Keys
+
+```text
+missing
+duplicates
+unexpected
+```
+
+### Business
+
+```text
+balances
+revenue
+orders
+customer counts
+```
+
+### Quality
+
+```text
+expectation violations
+NULL
+invalid domain
+```
+
+---
+
+## 11. Compare historical versions
+
+Cuando Delta history permita hacerlo, comparar estado anterior y posterior.
+
+No utilizar Time Travel como único mecanismo de rollback si retención o policies pueden eliminar archivos.
+
+---
+
+## 12. Observe downstream
+
+Después del backfill revisar:
+
+- pipeline runs;
+- backlog;
+- errors;
+- quality;
+- BI results;
+- Genie answers críticas;
+- business reconciliation.
+
+---
+
+## Output
+
+```text
+Reason:
+Target:
+Scope:
+
+Source durability:
+- ...
+
+Strategy:
+- append once
+- refresh
+- full refresh
+- reset checkpoint
+- new table
+- targeted correction
+
+Idempotency:
+- ...
+
+Pre-state:
+- ...
+
+Expected impact:
+- ...
+
+Validation:
+- ...
+
+Execution:
+- ...
+
+Reconciliation:
+- ...
+
+Rollback/recovery:
+- ...
+```
+
+---
+
+# Definition of Done
+
+- [ ] La causa está identificada.
+- [ ] Existe un scope exacto.
+- [ ] Se verificó disponibilidad histórica del source.
+- [ ] Se registró estado previo.
+- [ ] Se analizó downstream.
+- [ ] Se verificó idempotencia.
+- [ ] Se eligió la operación mínima necesaria.
+- [ ] No se modificaron checkpoints manualmente.
+- [ ] Se validó antes de ejecutar.
+- [ ] Se reconciliaron resultados.
+- [ ] Se observaron consumers downstream.
+- [ ] La ejecución quedó documentada en español.
+
+# Gotchas
+
+- Full refresh de streaming puede destruir datos no recuperables.
+- `once=True` vuelve a ejecutarse tras full refresh.
+- Replay puede duplicar datos en sinks no idempotentes.
+- El checkpoint no es un artefacto para editar manualmente.
+- COUNT no valida un backfill.
+- Una corrección histórica puede cambiar KPIs downstream aunque el pipeline esté healthy.
